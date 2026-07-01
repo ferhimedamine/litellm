@@ -27,9 +27,10 @@ Usage:
     )
 """
 
+import hashlib
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
@@ -37,6 +38,19 @@ from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
 )
+
+
+def _extract_text(content: Any) -> str:
+    """Extract plain text from message content that may be str or list (multimodal)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ).strip()
+    return str(content) if content else ""
 
 
 class DakeraMemoryLogger(CustomLogger):
@@ -52,6 +66,12 @@ class DakeraMemoryLogger(CustomLogger):
         top_k: Number of memories to recall per LLM call.
         session_id_key: Key in litellm call metadata used to group memories
             by session. Defaults to ``"session_id"``.
+
+    **Tenant isolation:** Always pass a unique ``session_id`` in call metadata to
+    prevent cross-user memory leakage. When no ``session_id`` is provided the logger
+    derives a namespace from the caller's API key hash, which isolates memory per
+    litellm API key but still mixes sessions for the same key. For strict per-user
+    isolation, supply ``metadata={"session_id": user_id}`` on every call.
     """
 
     def __init__(
@@ -78,10 +98,23 @@ class DakeraMemoryLogger(CustomLogger):
             h["Authorization"] = f"Bearer {self.api_key}"
         return h
 
-    def _session_id(self, metadata: Optional[Dict]) -> str:
-        if not metadata:
-            return "default"
-        return str(metadata.get(self.session_id_key, "default"))
+    def _session_id(
+        self,
+        metadata: Optional[Dict],
+        user_api_key_dict: Any = None,
+    ) -> str:
+        if metadata:
+            sid = metadata.get(self.session_id_key)
+            if sid:
+                return str(sid)
+        # Fall back to a stable per-API-key namespace to prevent cross-tenant leakage.
+        # This isolates memories per litellm API key when no explicit session is supplied.
+        caller_key: str = ""
+        if user_api_key_dict is not None:
+            caller_key = getattr(user_api_key_dict, "api_key", "") or ""
+        if caller_key:
+            return "key:" + hashlib.sha256(caller_key.encode()).hexdigest()[:16]
+        return "default"
 
     # ------------------------------------------------------------------
     # Pre-call hook: inject recalled memories before the model sees the prompt
@@ -100,8 +133,9 @@ class DakeraMemoryLogger(CustomLogger):
             if not messages:
                 return data
 
-            # Use the last user message as the semantic recall query
-            last_user = next(
+            # Use the last user message as the semantic recall query.
+            # _extract_text handles multimodal content (list of parts) gracefully.
+            raw_content = next(
                 (
                     m.get("content", "")
                     for m in reversed(messages)
@@ -109,16 +143,19 @@ class DakeraMemoryLogger(CustomLogger):
                 ),
                 None,
             )
+            if not raw_content:
+                return data
+            last_user = _extract_text(raw_content)
             if not last_user:
                 return data
 
-            session_id = self._session_id(data.get("metadata"))
+            session_id = self._session_id(data.get("metadata"), user_api_key_dict)
 
             resp = await self._http_handler.post(
                 url=f"{self.base_url}/v1/memories/search",
                 headers=self._headers(),
                 json={
-                    "query": last_user if isinstance(last_user, str) else str(last_user),
+                    "query": last_user,
                     "session_id": session_id,
                     "top_k": self.top_k,
                 },
@@ -174,7 +211,7 @@ class DakeraMemoryLogger(CustomLogger):
             messages: List[Dict] = kwargs.get("messages", [])
             session_id = self._session_id(kwargs.get("metadata"))
 
-            last_user = next(
+            raw_content = next(
                 (
                     m.get("content", "")
                     for m in reversed(messages)
@@ -182,6 +219,9 @@ class DakeraMemoryLogger(CustomLogger):
                 ),
                 None,
             )
+            if not raw_content:
+                return
+            last_user = _extract_text(raw_content)
             if not last_user:
                 return
 
